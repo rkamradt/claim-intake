@@ -101,11 +101,13 @@ jobs:
       - name: Smoke — GET /health
         # LocalStack API Gateway uses path-based routing:
         #   http://localhost:4566/restapis/<id>/<stage>/_user_request_/<path>
-        # The CloudFormation output returns the real amazonaws.com URL, which
-        # isn't reachable here, so we look up the API ID directly.
+        # Look up the API ID via the CloudFormation physical resource ID —
+        # more reliable than filtering by name which SAM may override.
         run: |
-          API_ID=$(aws apigateway get-rest-apis \
-            --query 'items[?name==`claim-intake`].id' \
+          API_ID=$(aws cloudformation describe-stack-resource \
+            --stack-name claim-intake \
+            --logical-resource-id ClaimIntakeApi \
+            --query 'StackResourceDetail.PhysicalResourceId' \
             --output text)
           echo "API_ID=${API_ID}"
           API_URL="http://localhost:4566/restapis/${API_ID}/v1/_user_request_"
