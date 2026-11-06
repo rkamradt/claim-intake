@@ -58,6 +58,9 @@ jobs:
         image: localstack/localstack:4.4
         env:
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+          # Run Lambdas in-process rather than spawning Docker containers.
+          # Required in CI where the service container can't reach the host Docker socket.
+          LAMBDA_RUNTIME_EXECUTOR: local
         ports:
           - 4566:4566
         options: >-
