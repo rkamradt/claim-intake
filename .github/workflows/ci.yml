@@ -64,7 +64,7 @@ jobs:
         uses: LocalStack/setup-localstack@v0.2.3
         with:
           image-tag: "4.4"
-          install-awslocal: "true"
+          install-awslocal: "false"
         env:
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
 
@@ -97,8 +97,9 @@ jobs:
               UseRealAI=false
 
       - name: Smoke — GET /health
+        # setup-localstack exports AWS_ENDPOINT_URL; AWS CLI v2 routes there automatically.
         run: |
-          API_URL=$(awslocal cloudformation describe-stacks \
+          API_URL=$(aws cloudformation describe-stacks \
             --stack-name claim-intake \
             --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
             --output text)
