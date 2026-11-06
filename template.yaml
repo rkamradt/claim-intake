@@ -22,10 +22,15 @@ Globals:
     Runtime: python3.12
     Timeout: 30
     MemorySize: 256
-    # Per-Lambda env vars (UPLOAD_BUCKET, CLAIMS_TABLE, queue URLs) are declared
-    # on each function individually as those resources are added in later PRs.
+    # Per-Lambda env vars are declared on each function individually.
 
 Resources:
+
+  # ── S3 ────────────────────────────────────────────────────────────────────
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: claim-intake-uploads
 
   # ── API Gateway ───────────────────────────────────────────────────────────
   ClaimIntakeApi:
@@ -43,7 +48,6 @@ Resources:
       Description: Liveness check — returns 200 + service status
       Environment:
         Variables:
-          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
           USE_REAL_AI: !Ref UseRealAI
       Events:
         HealthApi:
@@ -53,10 +57,83 @@ Resources:
             Path: /health
             Method: GET
 
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-upload
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/upload/
+      Description: >
+        POST /uploads — generates a presigned S3 PUT URL.
+        Client uploads the document directly to S3; this Lambda never touches
+        the document body, keeping it out of API Gateway's 10 MB payload limit.
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref UploadBucket
+      Events:
+        UploadApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ClaimIntakeApi
+            Path: /uploads
+            Method: POST
+
+  ClaimFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-get-claim
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/claim/
+      Description: >
+        GET /claims/{id} — returns a stored claim record.
+        Stub in PR 2; wired to DynamoDB in PR 3.
+      Events:
+        ClaimApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ClaimIntakeApi
+            Path: /claims/{id}
+            Method: GET
+
+  # ── S3-triggered extract Lambda ───────────────────────────────────────────
+  ExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-extract
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/extract/
+      Description: >
+        Triggered by S3 ObjectCreated. Reads the document, calls Anthropic
+        (or returns a mock), and logs structured JSON.
+        PR 3 adds: puts the result to SQS for the verify Lambda.
+      Timeout: 60
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          USE_REAL_AI: !Ref UseRealAI
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+      Events:
+        S3Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
 Outputs:
   ApiUrl:
     Description: Base URL for the claim-intake API
     Value: !Sub "https://${ClaimIntakeApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
-  HealthUrl:
-    Description: Health endpoint
-    Value: !Sub "https://${ClaimIntakeApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/health"
+  BucketName:
+    Description: S3 bucket for uploaded claim documents
+    Value: !Ref UploadBucket

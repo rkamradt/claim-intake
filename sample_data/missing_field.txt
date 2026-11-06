@@ -1,0 +1,13 @@
+INSURANCE CLAIM FORM
+====================
+Date: 2024-03-12
+Policy Number: POL-2024-55678
+
+LINE ITEMS:
+1. Dental cleaning: $120.00
+2. Dental X-ray: $80.00
+
+TOTAL AMOUNT: $200.00
+
+NOTE: Claimant name is intentionally absent.
+      The verify Lambda should mark this needs_review with reason "missing claimant_name".

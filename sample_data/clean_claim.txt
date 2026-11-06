@@ -1,0 +1,14 @@
+INSURANCE CLAIM FORM
+====================
+Date: 2024-03-15
+Claimant: Jane Smith
+Policy Number: POL-2024-98765
+
+LINE ITEMS:
+1. Emergency room visit: $850.00
+2. X-ray imaging: $320.00
+3. Prescription medication: $45.50
+
+TOTAL AMOUNT: $1215.50
+
+Signature: Jane Smith

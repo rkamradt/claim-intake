@@ -1,0 +1,17 @@
+INSURANCE CLAIM FORM
+====================
+Date: 2024-03-10
+Claimant: Bob Johnson
+Policy Number: POL-2024-11234
+
+LINE ITEMS:
+1. Specialist consultation: $200.00
+2. Lab work: $175.00
+3. Physical therapy session: $95.00
+
+TOTAL AMOUNT: $500.00
+
+Signature: Bob Johnson
+
+NOTE: Line items sum to $470.00 — total is overstated by $30.00.
+      The verify Lambda should catch this and mark the claim needs_review.

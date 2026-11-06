@@ -73,7 +73,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install SAM CLI + local tools
-        run: pip install aws-sam-cli-local pytest
+        run: pip install aws-sam-cli-local pytest httpx boto3
 
       - name: Configure AWS credentials for LocalStack
         # Env vars take priority over ~/.aws/credentials. AWS_ENDPOINT_URL
@@ -123,5 +123,6 @@ jobs:
       - name: E2E tests
         env:
           API_URL: ${{ env.API_URL }}
-          USE_MOCK_AI: "true"
+          LOCALSTACK_URL: http://localhost:4566
+          USE_REAL_AI: "false"
         run: pytest tests/e2e -v
