@@ -106,6 +106,40 @@ jobs `needs`.
 
 ---
 
+### LocalStack CI gotchas (lessons from getting PR 1 green)
+
+**CloudFormation `!Ref` in `Globals` resolves at deploy time.** You can't put
+`!Ref SomeResource` in `Globals.Function.Environment` if that resource doesn't
+exist in the template yet. CloudFormation validates the entire dependency graph
+before creating anything. `Globals` can only reference `Parameters`.
+
+**Lambda needs Docker — even on LocalStack.** By default LocalStack spawns a
+Docker container per Lambda invocation. In CI, the standard service-container
+approach can't mount the host's Docker socket (`/var/run/docker.sock`). The fix
+is to use the official `LocalStack/setup-localstack` GitHub Action, which starts
+LocalStack as a regular Docker step (with socket access) rather than a service
+container sidecar.
+
+**`AWS_ENDPOINT_URL` must be set explicitly.** The `setup-localstack` action
+documents that it exports `AWS_ENDPOINT_URL`, but the value doesn't reach
+subsequent job steps reliably. Write it to `$GITHUB_ENV` yourself. The AWS CLI
+v2 reads this variable and routes all calls to LocalStack instead of real AWS —
+no `awslocal` wrapper needed.
+
+**Don't double-install `awslocal`.** `aws-sam-cli-local` pulls in `awscli-local`
+as a dependency, which is an older package that crashes on `import botocore.vendored`
+(removed in modern botocore). If the action installs `awslocal`, don't also install
+it via pip.
+
+**API Gateway URL in LocalStack is path-based, not domain-based.** The SAM
+`Outputs` section emits `https://<id>.execute-api.<region>.amazonaws.com/<stage>`,
+which is unreachable in LocalStack. The working URL is:
+`http://localhost:4566/restapis/<id>/<stage>/_user_request_/<path>`.
+Retrieve the API ID via `aws cloudformation describe-stack-resource --logical-resource-id ClaimIntakeApi`,
+not by querying API Gateway by name (SAM may set a different name than you expect).
+
+---
+
 *More sections added in subsequent PRs:*
 - *PR 2: S3 presigned URLs, event notifications, the extract Lambda*
 - *PR 3: SQS, event source mappings, DynamoDB, idempotency*
