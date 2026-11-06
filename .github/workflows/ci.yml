@@ -48,37 +48,32 @@ jobs:
         run: bash _gate/ai-gate/gate.sh
 
   # ── SAM CI ────────────────────────────────────────────────────────────────
-  # Spins up a throwaway LocalStack container, deploys the SAM stack,
-  # runs unit tests and the e2e smoke suite (Anthropic mocked).
+  # Starts LocalStack as a Docker step (not a service container) so we can
+  # mount /var/run/docker.sock — LocalStack needs the Docker socket to spawn
+  # Lambda execution containers. Service containers can't mount host paths.
   sam-ci:
     needs: [ai-gate]
     runs-on: ubuntu-latest
-    services:
-      localstack:
-        image: localstack/localstack:4.4
-        env:
-          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
-          # Run Lambdas in-process rather than spawning Docker containers.
-          # Required in CI where the service container can't reach the host Docker socket.
-          LAMBDA_RUNTIME_EXECUTOR: local
-        ports:
-          - 4566:4566
-        options: >-
-          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
+
+      # Official LocalStack GH Action: starts LocalStack with the Docker socket
+      # mounted, waits for it to be healthy, and exports AWS_ENDPOINT_URL.
+      - name: Start LocalStack
+        uses: LocalStack/setup-localstack@v0.2.3
+        with:
+          image-tag: "4.4"
+          install-awslocal: "true"
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install SAM CLI + local tools
-        run: |
-          pip install aws-sam-cli-local awscli-local pytest
+        run: pip install aws-sam-cli-local pytest
 
       - name: Configure dummy AWS credentials
         # LocalStack accepts any non-empty credentials
@@ -103,7 +98,6 @@ jobs:
 
       - name: Smoke — GET /health
         run: |
-          # Retrieve the API URL from the CloudFormation stack outputs
           API_URL=$(awslocal cloudformation describe-stacks \
             --stack-name claim-intake \
             --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
