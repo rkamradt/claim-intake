@@ -27,10 +27,34 @@ Globals:
 Resources:
 
   # ── S3 ────────────────────────────────────────────────────────────────────
+  # The S3 → Lambda notification creates UploadBucket → ExtractFunction.
+  # If ExtractFunction also referenced the bucket via !Ref, CloudFormation
+  # would see a cycle. Solution: use the literal bucket name in ExtractFunction
+  # (breaking the reverse dependency), wire the notification manually with
+  # DependsOn, and grant S3 permission to invoke the Lambda explicitly.
+
+  ExtractFunctionS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ExtractFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::claim-intake-uploads"
+
   UploadBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ExtractFunctionS3Permission
     Properties:
       BucketName: claim-intake-uploads
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+            Function: !GetAtt ExtractFunction.Arn
 
   # ── API Gateway ───────────────────────────────────────────────────────────
   ClaimIntakeApi:
@@ -99,6 +123,8 @@ Resources:
             Method: GET
 
   # ── S3-triggered extract Lambda ───────────────────────────────────────────
+  # ExtractFunction uses literal "claim-intake-uploads" (not !Ref) to avoid
+  # a circular dependency with UploadBucket. See note above UploadBucket.
   ExtractFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -112,23 +138,12 @@ Resources:
       Timeout: 60
       Environment:
         Variables:
-          UPLOAD_BUCKET: !Ref UploadBucket
+          UPLOAD_BUCKET: "claim-intake-uploads"
           ANTHROPIC_API_KEY: !Ref AnthropicApiKey
           USE_REAL_AI: !Ref UseRealAI
       Policies:
         - S3ReadPolicy:
-            BucketName: !Ref UploadBucket
-      Events:
-        S3Upload:
-          Type: S3
-          Properties:
-            Bucket: !Ref UploadBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: uploads/
+            BucketName: "claim-intake-uploads"
 
 Outputs:
   ApiUrl:
