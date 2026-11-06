@@ -75,12 +75,13 @@ jobs:
       - name: Install SAM CLI + local tools
         run: pip install aws-sam-cli-local pytest
 
-      - name: Configure dummy AWS credentials
-        # LocalStack accepts any non-empty credentials
+      - name: Configure AWS credentials for LocalStack
+        # Env vars take priority over ~/.aws/credentials and cannot be
+        # overridden by setup-localstack. LocalStack accepts any non-empty value.
         run: |
-          aws configure set aws_access_key_id test
-          aws configure set aws_secret_access_key test
-          aws configure set region us-east-1
+          echo "AWS_ACCESS_KEY_ID=test" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=test" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
 
       - name: SAM build
         run: samlocal build
