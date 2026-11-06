@@ -1,0 +1,21 @@
+# SAM build artifacts
+.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Test output
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Local env
+.env
+*.local

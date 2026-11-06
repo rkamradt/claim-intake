@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  claim-intake — serverless insurance claim ingestion and AI extraction pipeline.
+  Runs entirely on LocalStack (no real AWS account required).
+
+Parameters:
+  StageName:
+    Type: String
+    Default: v1
+  AnthropicApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+  UseRealAI:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        CLAIMS_TABLE: !Ref ClaimsTable
+        UPLOAD_BUCKET: !Ref UploadBucket
+        EXTRACT_QUEUE_URL: !Ref ExtractQueue
+        REVIEW_QUEUE_URL: !Ref NeedsReviewQueue
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        USE_REAL_AI: !Ref UseRealAI
+
+Resources:
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+  ClaimIntakeApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref StageName
+      Description: claim-intake REST API
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-health
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/health/
+      Description: Liveness check — returns 200 + service status
+      Events:
+        HealthApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ClaimIntakeApi
+            Path: /health
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the claim-intake API
+    Value: !Sub "https://${ClaimIntakeApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  HealthUrl:
+    Description: Health endpoint
+    Value: !Sub "https://${ClaimIntakeApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/health"

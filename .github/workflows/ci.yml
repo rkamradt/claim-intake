@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+jobs:
+
+  # ── AI gate ───────────────────────────────────────────────────────────────
+  # Same gate that python-image.yml / java-image.yml run.
+  # Checks the diff for hardcoded secrets, bad K8s YAML, and AI-reviewed rules.
+  ai-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: rkamradt/ci-workflows
+          path: _gate
+          ref: main
+
+      - name: Install tools
+        run: |
+          GITLEAKS_VER=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" \
+            | tar xz -C /usr/local/bin gitleaks
+          KL_VER=0.6.8
+          mkdir -p /tmp/kl && \
+            curl -sSfL "https://github.com/stackrox/kube-linter/releases/download/v${KL_VER}/kube-linter_linux_amd64.tar.gz" \
+            | tar xz -C /tmp/kl && cp /tmp/kl/kube-linter /usr/local/bin/ 2>/dev/null || true
+          npm install -g @anthropic-ai/claude-code --quiet
+
+      - name: Run AI gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GATE_DIR: ${{ github.workspace }}/_gate/ai-gate
+        run: bash _gate/ai-gate/gate.sh
+
+  # ── SAM CI ────────────────────────────────────────────────────────────────
+  # Spins up a throwaway LocalStack container, deploys the SAM stack,
+  # runs unit tests and the e2e smoke suite (Anthropic mocked).
+  sam-ci:
+    needs: [ai-gate]
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:4.4
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install SAM CLI + local tools
+        run: |
+          pip install aws-sam-cli-local awscli-local pytest
+
+      - name: Configure dummy AWS credentials
+        # LocalStack accepts any non-empty credentials
+        run: |
+          aws configure set aws_access_key_id test
+          aws configure set aws_secret_access_key test
+          aws configure set region us-east-1
+
+      - name: SAM build
+        run: samlocal build
+
+      - name: SAM deploy
+        run: |
+          samlocal deploy \
+            --stack-name claim-intake \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              AnthropicApiKey=mock \
+              UseRealAI=false
+
+      - name: Smoke — GET /health
+        run: |
+          # Retrieve the API URL from the CloudFormation stack outputs
+          API_URL=$(awslocal cloudformation describe-stacks \
+            --stack-name claim-intake \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+            --output text)
+          echo "API_URL=${API_URL}" >> $GITHUB_ENV
+          STATUS=$(curl -sf "${API_URL}/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          test "${STATUS}" = "ok"
+
+      - name: Unit tests
+        run: pytest tests/unit -v
+
+      - name: E2E tests
+        env:
+          API_URL: ${{ env.API_URL }}
+          USE_MOCK_AI: "true"
+        run: pytest tests/e2e -v

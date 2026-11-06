@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claim-intake"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Lambda dependencies are managed per-Lambda in lambdas/<name>/requirements.txt
+# and bundled by SAM. This file is for dev/test tooling only.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27.0",
+    "boto3>=1.35.0",
+    "moto[s3,sqs,dynamodb]>=5.0.0",
+    "anthropic>=0.40.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

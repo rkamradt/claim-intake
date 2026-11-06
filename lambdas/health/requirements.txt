@@ -1,0 +1,1 @@
+# health Lambda has no external dependencies
