@@ -140,6 +140,87 @@ not by querying API Gateway by name (SAM may set a different name than you expec
 
 ---
 
+---
+
+## PR 2 — S3, presigned URLs, and the extract Lambda
+
+### AWS::S3::Bucket and event notifications
+
+An S3 bucket is just object storage with a REST API. What makes it interesting
+for event-driven architectures is `NotificationConfiguration`: the bucket can
+push an event to a Lambda, an SQS queue, or an SNS topic when objects are
+created, deleted, or tagged.
+
+The event payload the Lambda receives includes the bucket name, the object key,
+the ETag (an MD5 of the object body for single-part uploads), the object size,
+and the event timestamp. It does NOT include the object body — the Lambda must
+call `s3.get_object()` to fetch it.
+
+### Presigned URLs
+
+A presigned URL is a time-limited, pre-authenticated URL for a single S3
+operation (GET or PUT). The Lambda generates it using its IAM credentials; the
+client uses it directly without any AWS credentials of its own.
+
+Why use them here: API Gateway has a 10 MB request body limit. By returning a
+presigned PUT URL, the upload Lambda sidesteps this limit — the client writes
+directly to S3 without touching API Gateway or Lambda memory. The Lambda only
+handles the small JSON payload (`{"filename": "claim.txt"}`).
+
+```python
+url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": BUCKET, "Key": s3_key},
+    ExpiresIn=300,  # seconds
+)
+```
+
+The expiry clock starts when the URL is generated, not when the client starts
+uploading. 300 seconds (5 min) is generous for a document upload.
+
+### The S3 ↔ Lambda circular dependency
+
+CloudFormation builds a dependency graph before creating anything. If a Lambda
+references an S3 bucket (`!Ref UploadBucket` in env vars or policies), and that
+same bucket has a `NotificationConfiguration` pointing at the Lambda, CloudFormation
+sees: Lambda → Bucket → Lambda. That's a cycle; deployment fails.
+
+**SAM's `Type: S3` event source makes this worse** — it implicitly injects the
+`NotificationConfiguration` into the bucket resource, so the cycle appears even
+if you don't write it explicitly.
+
+The fix is the standard CloudFormation pattern:
+
+1. Remove all `!Ref Bucket` from the Lambda (use the literal bucket name string).
+2. Create `AWS::Lambda::Permission` explicitly (grants S3 the right to invoke the Lambda).
+3. Put `NotificationConfiguration` directly in the bucket resource (not via SAM events).
+4. Add `DependsOn: <LambdaPermission>` to the bucket so the permission exists before S3 fires.
+
+Dependency order: `ExtractFunction` → `ExtractFunctionS3Permission` → `UploadBucket`.
+No cycles.
+
+### Idempotency key design
+
+The idempotency key is `sha256(s3_key:etag)[:32]`. This is set up in PR 2 (the
+extract Lambda computes it) even though it isn't persisted until PR 3 (DynamoDB).
+
+**Why this design:**
+- `s3_key` includes a UUID (`uploads/<uuid>/filename`), so two uploads of the
+  same file get different keys — they might be legitimately separate claims.
+- `etag` is a content hash of the object bytes. If the same client retries an
+  upload that succeeded (same bytes, same UUID because they kept the s3_key),
+  `etag` matches and the key is identical — the second write to DynamoDB is a
+  no-op (conditional put). That's the retry-safe path.
+- Together: different documents → different keys; same document re-uploaded →
+  same key → one record. This is the definition of idempotency.
+
+**Why this comes up in interviews:** Distributed systems can deliver events more
+than once (SQS standard queues have at-least-once delivery). Without idempotency,
+a retried SQS message creates a duplicate DynamoDB record. With the conditional
+put (`ConditionExpression: attribute_not_exists(pk)`), the second write simply
+fails with `ConditionalCheckFailedException`, which the Lambda ignores. One record,
+regardless of how many times the message is delivered.
+
 *More sections added in subsequent PRs:*
 - *PR 2: S3 presigned URLs, event notifications, the extract Lambda*
 - *PR 3: SQS, event source mappings, DynamoDB, idempotency*
