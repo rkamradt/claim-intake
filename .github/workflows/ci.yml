@@ -99,14 +99,20 @@ jobs:
               UseRealAI=false
 
       - name: Smoke — GET /health
-        # setup-localstack exports AWS_ENDPOINT_URL; AWS CLI v2 routes there automatically.
+        # LocalStack API Gateway uses path-based routing:
+        #   http://localhost:4566/restapis/<id>/<stage>/_user_request_/<path>
+        # The CloudFormation output returns the real amazonaws.com URL, which
+        # isn't reachable here, so we look up the API ID directly.
         run: |
-          API_URL=$(aws cloudformation describe-stacks \
-            --stack-name claim-intake \
-            --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+          API_ID=$(aws apigateway get-rest-apis \
+            --query 'items[?name==`claim-intake`].id' \
             --output text)
+          echo "API_ID=${API_ID}"
+          API_URL="http://localhost:4566/restapis/${API_ID}/v1/_user_request_"
           echo "API_URL=${API_URL}" >> $GITHUB_ENV
-          STATUS=$(curl -sf "${API_URL}/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          RESPONSE=$(curl -s "${API_URL}/health")
+          echo "Response: ${RESPONSE}"
+          STATUS=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
           test "${STATUS}" = "ok"
 
       - name: Unit tests
