@@ -1,0 +1,12 @@
+[allowlist]
+description = "False positives in claim-intake"
+
+regexes = [
+  # SAM parameter override in CI: AnthropicApiKey=mock is a placeholder,
+  # not a real credential. Real keys come from GitHub secrets at runtime.
+  '''AnthropicApiKey=mock''',
+  # Template parameter definitions are schema, not values
+  '''AnthropicApiKey:''',
+  # Environment variable names (not values) in Lambda handler code
+  '''ANTHROPIC_API_KEY\s*=\s*os\.environ''',
+]
