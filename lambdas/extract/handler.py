@@ -29,6 +29,7 @@ logger.setLevel(logging.INFO)
 
 USE_REAL_AI = os.environ.get("USE_REAL_AI", "false").lower() == "true"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+EXTRACT_QUEUE_URL = os.environ.get("EXTRACT_QUEUE_URL", "")
 
 
 # ── Idempotency key ───────────────────────────────────────────────────────────
@@ -130,7 +131,8 @@ def lambda_handler(event, context):
 
         logger.info("Extracted: %s", json.dumps({k: v for k, v in result.items()
                                                    if k != "source_text"}))
-        # PR 3: sqs.send_message(QueueUrl=EXTRACT_QUEUE_URL, MessageBody=json.dumps(result))
+        sqs = boto3.client("sqs")
+        sqs.send_message(QueueUrl=EXTRACT_QUEUE_URL, MessageBody=json.dumps(result))
         results.append(result)
 
     return results

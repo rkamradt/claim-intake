@@ -73,7 +73,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install SAM CLI + local tools
-        run: pip install aws-sam-cli-local pytest httpx boto3
+        run: pip install aws-sam-cli-local pytest httpx boto3 pytest-timeout
 
       - name: Configure AWS credentials for LocalStack
         # Env vars take priority over ~/.aws/credentials. AWS_ENDPOINT_URL
@@ -125,4 +125,5 @@ jobs:
           API_URL: ${{ env.API_URL }}
           LOCALSTACK_URL: http://localhost:4566
           USE_REAL_AI: "false"
-        run: pytest tests/e2e -v
+          POLL_TIMEOUT: "45"
+        run: pytest tests/e2e -v --timeout=120

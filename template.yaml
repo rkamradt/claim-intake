@@ -26,6 +26,29 @@ Globals:
 
 Resources:
 
+  # ── SQS ───────────────────────────────────────────────────────────────────
+  # ExtractQueue carries extracted claim JSON from the extract Lambda to the
+  # verify Lambda. PR 4 adds a DLQ (after 3 failed receives) and the
+  # NeedsReviewQueue for claims that fail verification.
+  ExtractQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: claim-intake-extract
+      VisibilityTimeout: 90   # must be >= VerifyFunction timeout
+
+  # ── DynamoDB ──────────────────────────────────────────────────────────────
+  ClaimsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: claims
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
   # ── S3 ────────────────────────────────────────────────────────────────────
   # The S3 → Lambda notification creates UploadBucket → ExtractFunction.
   # If ExtractFunction also referenced the bucket via !Ref, CloudFormation
@@ -111,9 +134,13 @@ Resources:
       FunctionName: claim-intake-get-claim
       Handler: handler.lambda_handler
       CodeUri: lambdas/claim/
-      Description: >
-        GET /claims/{id} — returns a stored claim record.
-        Stub in PR 2; wired to DynamoDB in PR 3.
+      Description: GET /claims/{id} — returns a stored claim record from DynamoDB.
+      Environment:
+        Variables:
+          CLAIMS_TABLE: !Ref ClaimsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ClaimsTable
       Events:
         ClaimApi:
           Type: Api
@@ -133,17 +160,48 @@ Resources:
       CodeUri: lambdas/extract/
       Description: >
         Triggered by S3 ObjectCreated. Reads the document, calls Anthropic
-        (or returns a mock), and logs structured JSON.
-        PR 3 adds: puts the result to SQS for the verify Lambda.
+        (or returns a mock), and puts structured JSON onto ExtractQueue.
       Timeout: 60
       Environment:
         Variables:
           UPLOAD_BUCKET: "claim-intake-uploads"
+          EXTRACT_QUEUE_URL: !Ref ExtractQueue
           ANTHROPIC_API_KEY: !Ref AnthropicApiKey
           USE_REAL_AI: !Ref UseRealAI
       Policies:
         - S3ReadPolicy:
             BucketName: "claim-intake-uploads"
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ExtractQueue.QueueName
+
+  # ── SQS-triggered verify Lambda ───────────────────────────────────────────
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-verify
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/verify/
+      Description: >
+        Consumes ExtractQueue. Runs code checks on the AI output and writes
+        accepted or needs_review records to DynamoDB with a conditional put
+        (idempotency — duplicate SQS deliveries never create a second record).
+      Timeout: 60
+      Environment:
+        Variables:
+          CLAIMS_TABLE: !Ref ClaimsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref ClaimsTable
+      Events:
+        SQSExtract:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ExtractQueue.Arn
+            BatchSize: 1
+            # ReportBatchItemFailures: the Lambda returns a list of message IDs
+            # that failed so SQS retries only those, not the whole batch.
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
 Outputs:
   ApiUrl:
@@ -152,3 +210,9 @@ Outputs:
   BucketName:
     Description: S3 bucket for uploaded claim documents
     Value: !Ref UploadBucket
+  ClaimsTableName:
+    Description: DynamoDB claims table
+    Value: !Ref ClaimsTable
+  ExtractQueueUrl:
+    Description: SQS queue between extract and verify
+    Value: !Ref ExtractQueue

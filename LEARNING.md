@@ -221,6 +221,99 @@ put (`ConditionExpression: attribute_not_exists(pk)`), the second write simply
 fails with `ConditionalCheckFailedException`, which the Lambda ignores. One record,
 regardless of how many times the message is delivered.
 
+---
+
+## PR 3 — SQS, event source mappings, DynamoDB, and idempotency
+
+### Why SQS sits between extract and verify
+
+The extract Lambda returns as soon as it puts a message on the queue. The verify
+Lambda runs independently. This decoupling has three consequences worth knowing:
+
+1. **Retry is free.** If verify crashes, SQS holds the message and retries it
+   up to the configured receive count. No data is lost. Without the queue, a
+   verify crash would lose the extracted data forever.
+2. **Back-pressure.** If verify is slow, messages queue up. SQS can scale the
+   verify Lambda concurrency automatically. Without the queue, a slow verify
+   would block extract from returning.
+3. **Observability.** You can see the queue depth in CloudWatch/LocalStack.
+   A growing queue is an early warning that verify is falling behind.
+
+### SQS event source mapping
+
+```yaml
+Events:
+  SQSExtract:
+    Type: SQS
+    Properties:
+      Queue: !GetAtt ExtractQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+```
+
+SAM creates an `AWS::Lambda::EventSourceMapping` that polls the queue and invokes
+the Lambda. `BatchSize: 1` means one SQS message per Lambda invocation (simpler
+error handling). `ReportBatchItemFailures` lets the Lambda return a list of
+failed message IDs — SQS retries only those, not the whole batch. Without it,
+any exception in a batch causes all messages to be retried, including ones that
+succeeded.
+
+`VisibilityTimeout` on the queue must be `>= Lambda timeout`. When SQS delivers a
+message it hides it for `VisibilityTimeout` seconds. If the Lambda doesn't
+finish in time, SQS re-delivers the message. Setting the timeout shorter than the
+Lambda runtime means every invocation triggers an unnecessary retry.
+
+### DynamoDB basics
+
+DynamoDB is a key-value / document store. Each item has a primary key; everything
+else is optional. `BillingMode: PAY_PER_REQUEST` means you pay per read/write
+unit, no capacity planning needed — appropriate for a learning project with
+unpredictable traffic.
+
+### Idempotency with conditional writes
+
+The verify Lambda writes each claim with:
+
+```python
+table.put_item(
+    Item=item,
+    ConditionExpression=Attr("pk").not_exists(),
+)
+```
+
+`attribute_not_exists(pk)` succeeds only when no item with this `pk` exists yet.
+On a retry (same `pk`), DynamoDB raises `ConditionalCheckFailedException`. We
+catch it and return without error — the original record is preserved.
+
+**Why this matters:** SQS standard queues guarantee *at-least-once* delivery.
+Duplicate delivery is not a bug; it is a documented behaviour. The correct
+response is to make your consumer idempotent, not to assume duplicates won't
+happen. The conditional put is the standard DynamoDB pattern for this.
+
+**The idempotency key** is `sha256(s3_key:etag)[:32]`:
+- `s3_key` includes a UUID, so two separate uploads (even of identical content)
+  get different keys — they are logically different events.
+- `etag` is a content hash. If the *same upload* (same s3_key, same bytes) is
+  processed twice because SQS re-delivered the message, `etag` is the same, so
+  the key is the same, and the second `put_item` is a no-op.
+
+### ReportBatchItemFailures vs a simple exception
+
+Without `ReportBatchItemFailures`, if the Lambda raises an exception, SQS retries
+the *entire batch*. With `BatchSize: 1` this doesn't matter much — there is only
+one message per invocation. But it matters as soon as you increase `BatchSize`
+for throughput: a single bad message would cause all good messages in the batch
+to be retried. `ReportBatchItemFailures` lets you return exactly which message
+IDs failed; the rest are acknowledged.
+
+The verify Lambda distinguishes two kinds of "failure":
+1. **Verification failure** (bad total, missing field): the claim is stored with
+   `status=needs_review`. This is *not* a processing error — the message is
+   acknowledged normally.
+2. **Processing error** (unexpected exception, DynamoDB unavailable): the message
+   ID is added to `batchItemFailures`. SQS re-delivers it for a retry.
+
 *More sections added in subsequent PRs:*
 - *PR 2: S3 presigned URLs, event notifications, the extract Lambda*
 - *PR 3: SQS, event source mappings, DynamoDB, idempotency*
