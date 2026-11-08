@@ -30,6 +30,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 CLAIMS_TABLE = os.environ["CLAIMS_TABLE"]
+NEEDS_REVIEW_QUEUE_URL = os.environ.get("NEEDS_REVIEW_QUEUE_URL", "")
 REQUIRED_FIELDS = ["claimant_name", "date", "total_amount", "line_items"]
 
 
@@ -151,7 +152,16 @@ def lambda_handler(event, context):
                     extracted.get("idempotency_key"),
                     reasons,
                 )
-                # PR 4: publish to NeedsReviewQueue
+                if NEEDS_REVIEW_QUEUE_URL:
+                    sqs = boto3.client("sqs")
+                    sqs.send_message(
+                        QueueUrl=NEEDS_REVIEW_QUEUE_URL,
+                        MessageBody=json.dumps({
+                            "pk": extracted.get("idempotency_key"),
+                            "s3_key": extracted.get("s3_key"),
+                            "review_reasons": reasons,
+                        }),
+                    )
 
         except Exception as exc:
             # Unexpected error (bad JSON, DynamoDB unavailable, etc.)

@@ -16,25 +16,48 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+  GapThresholdMinutes:
+    Type: String
+    Default: "10"
+    Description: >
+      Reconcile Lambda flags S3 objects older than this many minutes with no
+      DynamoDB record. Set low (e.g. 2) for local testing.
 
 Globals:
   Function:
     Runtime: python3.12
     Timeout: 30
     MemorySize: 256
-    # Per-Lambda env vars are declared on each function individually.
 
 Resources:
 
   # ── SQS ───────────────────────────────────────────────────────────────────
-  # ExtractQueue carries extracted claim JSON from the extract Lambda to the
-  # verify Lambda. PR 4 adds a DLQ (after 3 failed receives) and the
-  # NeedsReviewQueue for claims that fail verification.
+
+  # Dead-letter queue: messages land here after 3 failed processing attempts.
+  # Retention: 14 days (max), giving the ops team time to inspect and redrive.
+  ExtractDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: claim-intake-extract-dlq
+      MessageRetentionPeriod: 1209600  # 14 days in seconds
+
+  # Main extract→verify queue. RedrivePolicy wires it to the DLQ.
   ExtractQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: claim-intake-extract
-      VisibilityTimeout: 90   # must be >= VerifyFunction timeout
+      VisibilityTimeout: 90
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExtractDLQ.Arn
+        maxReceiveCount: 3
+
+  # Receives a message for every claim that fails verification.
+  # Consumers (alerts, human-review workflows) subscribe to this queue.
+  # In this project it is the signal source for the reconcile report.
+  NeedsReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: claim-intake-needs-review
 
   # ── DynamoDB ──────────────────────────────────────────────────────────────
   ClaimsTable:
@@ -45,17 +68,20 @@ Resources:
       AttributeDefinitions:
         - AttributeName: pk
           AttributeType: S
+        - AttributeName: s3_key
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: s3_key-index
+          KeySchema:
+            - AttributeName: s3_key
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
 
   # ── S3 ────────────────────────────────────────────────────────────────────
-  # The S3 → Lambda notification creates UploadBucket → ExtractFunction.
-  # If ExtractFunction also referenced the bucket via !Ref, CloudFormation
-  # would see a cycle. Solution: use the literal bucket name in ExtractFunction
-  # (breaking the reverse dependency), wire the notification manually with
-  # DependsOn, and grant S3 permission to invoke the Lambda explicitly.
-
   ExtractFunctionS3Permission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -110,10 +136,7 @@ Resources:
       FunctionName: claim-intake-upload
       Handler: handler.lambda_handler
       CodeUri: lambdas/upload/
-      Description: >
-        POST /uploads — generates a presigned S3 PUT URL.
-        Client uploads the document directly to S3; this Lambda never touches
-        the document body, keeping it out of API Gateway's 10 MB payload limit.
+      Description: POST /uploads — generates a presigned S3 PUT URL.
       Environment:
         Variables:
           UPLOAD_BUCKET: !Ref UploadBucket
@@ -150,8 +173,6 @@ Resources:
             Method: GET
 
   # ── S3-triggered extract Lambda ───────────────────────────────────────────
-  # ExtractFunction uses literal "claim-intake-uploads" (not !Ref) to avoid
-  # a circular dependency with UploadBucket. See note above UploadBucket.
   ExtractFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -182,26 +203,59 @@ Resources:
       Handler: handler.lambda_handler
       CodeUri: lambdas/verify/
       Description: >
-        Consumes ExtractQueue. Runs code checks on the AI output and writes
-        accepted or needs_review records to DynamoDB with a conditional put
-        (idempotency — duplicate SQS deliveries never create a second record).
+        Consumes ExtractQueue. Runs code checks, writes to DynamoDB with
+        conditional put (idempotency), and publishes needs_review claims
+        to NeedsReviewQueue.
       Timeout: 60
       Environment:
         Variables:
           CLAIMS_TABLE: !Ref ClaimsTable
+          NEEDS_REVIEW_QUEUE_URL: !Ref NeedsReviewQueue
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref ClaimsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt NeedsReviewQueue.QueueName
       Events:
         SQSExtract:
           Type: SQS
           Properties:
             Queue: !GetAtt ExtractQueue.Arn
             BatchSize: 1
-            # ReportBatchItemFailures: the Lambda returns a list of message IDs
-            # that failed so SQS retries only those, not the whole batch.
             FunctionResponseTypes:
               - ReportBatchItemFailures
+
+  # ── Scheduled reconcile Lambda ────────────────────────────────────────────
+  ReconcileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: claim-intake-reconcile
+      Handler: handler.lambda_handler
+      CodeUri: lambdas/reconcile/
+      Description: >
+        Runs on a schedule (EventBridge). Finds S3 objects with no DynamoDB
+        record after GapThresholdMinutes, and reports DLQ depth.
+        Logs a JSON report suitable for Loki ingestion.
+      Timeout: 300
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: "claim-intake-uploads"
+          CLAIMS_TABLE: !Ref ClaimsTable
+          EXTRACT_DLQ_URL: !Ref ExtractDLQ
+          GAP_THRESHOLD_MINUTES: !Ref GapThresholdMinutes
+      Policies:
+        - S3ReadPolicy:
+            BucketName: "claim-intake-uploads"
+        - DynamoDBReadPolicy:
+            TableName: !Ref ClaimsTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ExtractDLQ.QueueName
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Enabled: true
 
 Outputs:
   ApiUrl:
@@ -216,3 +270,9 @@ Outputs:
   ExtractQueueUrl:
     Description: SQS queue between extract and verify
     Value: !Ref ExtractQueue
+  ExtractDlqUrl:
+    Description: Dead-letter queue for failed extract messages
+    Value: !Ref ExtractDLQ
+  NeedsReviewQueueUrl:
+    Description: SQS queue for claims that failed verification
+    Value: !Ref NeedsReviewQueue

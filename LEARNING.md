@@ -317,5 +317,122 @@ The verify Lambda distinguishes two kinds of "failure":
 *More sections added in subsequent PRs:*
 - *PR 2: S3 presigned URLs, event notifications, the extract Lambda*
 - *PR 3: SQS, event source mappings, DynamoDB, idempotency*
-- *PR 4: Dead-letter queues, redrive policy, EventBridge schedules*
+- *PR 4: Dead-letter queues, redrive policy, EventBridge schedules (below)*
 - *PR 5: ArgoCD PostSync hooks, in-cluster SAM deployment*
+
+---
+
+## PR 4 — Dead-letter queues, needs-review routing, and EventBridge schedules
+
+### Dead-letter queues (DLQ)
+
+A DLQ is an SQS queue that receives messages that could not be processed after
+*n* attempts. The `RedrivePolicy` on a source queue wires it to the DLQ:
+
+```yaml
+ExtractQueue:
+  Type: AWS::SQS::Queue
+  Properties:
+    RedrivePolicy:
+      deadLetterTargetArn: !GetAtt ExtractDLQ.Arn
+      maxReceiveCount: 3
+```
+
+`maxReceiveCount: 3` means: after the message has been received (and not
+deleted) three times, SQS moves it to the DLQ instead of re-queuing it.
+The DLQ has `MessageRetentionPeriod: 1209600` (14 days — the maximum) so
+the ops team has time to inspect and redrive.
+
+**Why 3?** One for the original attempt, one for a transient retry, one for a
+second transient retry. If it still fails after three tries, the problem is
+likely not transient — a human should look at it. Too low (1) causes legitimate
+transients to poison the DLQ; too high (10+) delays the ops alert.
+
+**Terraform equivalent:** `aws_sqs_queue_redrive_policy` or the
+`redrive_policy` block on `aws_sqs_queue`.
+
+### NeedsReviewQueue — domain-level routing
+
+The DLQ captures *processing* failures (exceptions, infrastructure outages).
+The `NeedsReviewQueue` captures *domain* failures (bad totals, missing fields).
+These are different signals:
+
+- DLQ → ops alert, possible infrastructure issue
+- NeedsReviewQueue → human claims reviewer, possible fraud or data quality issue
+
+The verify Lambda publishes to `NeedsReviewQueue` after storing the claim:
+
+```python
+sqs.send_message(
+    QueueUrl=NEEDS_REVIEW_QUEUE_URL,
+    MessageBody=json.dumps({
+        "pk": extracted.get("idempotency_key"),
+        "s3_key": extracted.get("s3_key"),
+        "review_reasons": reasons,
+    }),
+)
+```
+
+Downstream consumers (a human-review UI, an alerting Lambda, an email
+notifier) subscribe to this queue without touching the main pipeline. This is
+the fan-out pattern: one event, multiple consumers, fully decoupled.
+
+### EventBridge schedules
+
+EventBridge (formerly CloudWatch Events) delivers events on a schedule. The
+SAM shorthand:
+
+```yaml
+Events:
+  ScheduleEvent:
+    Type: Schedule
+    Properties:
+      Schedule: rate(10 minutes)
+      Enabled: true
+```
+
+SAM creates an EventBridge rule and a Lambda permission automatically.
+`rate(10 minutes)` is the cron-lite syntax; `cron(0/10 * * * ? *)` is the
+full cron form for the same interval.
+
+**Mental model:** EventBridge is like a Kubernetes `CronJob`, but serverless.
+The rule fires on the schedule, EventBridge invokes the Lambda directly.
+No queue involved — the Lambda either succeeds or its CloudWatch log shows
+the error. If reliability matters, add an SQS queue between EventBridge and
+the Lambda (EventBridge can target SQS as well).
+
+### The reconcile pattern
+
+The reconcile Lambda is a gap-detection watchdog:
+
+1. **List all S3 objects** under `uploads/` older than N minutes.
+2. **Query DynamoDB** via the `s3_key-index` GSI for each one.
+3. **Flag any object with no DynamoDB record** — that upload was never processed.
+4. **Report DLQ depth** — a non-zero depth means the extract→verify pipeline
+   has permanently failed messages waiting for redrive.
+5. **Emit a single structured JSON log line** — Loki/Promtail can ingest this.
+
+The gap threshold (default 10 minutes, configurable via `GapThresholdMinutes`)
+gives the pipeline time to process a fresh upload before the reconcile run
+flags it. Setting it to 2 minutes during local testing lets you see gaps
+appear and resolve without waiting.
+
+**Why a GSI?** DynamoDB primary key is the idempotency key (a hash of
+`s3_key:etag`). To look up a record by `s3_key`, you need a secondary index.
+The `s3_key-index` GSI projects all attributes, so a single `query()` call
+returns the full record. Without the GSI you'd have to scan the whole table —
+expensive and slow at scale.
+
+**Why structured logging?** A single JSON line is trivially parseable by
+Grafana Loki via a pipeline stage:
+```yaml
+- json:
+    expressions:
+      gap_count: gap_count
+      dlq_depth: dlq_depth
+- metrics:
+    gap_count:
+      type: Counter
+```
+This turns a Lambda log into a Grafana time-series with no extra
+infrastructure.
