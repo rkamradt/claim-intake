@@ -436,3 +436,116 @@ Grafana Loki via a pipeline stage:
 ```
 This turns a Lambda log into a Grafana time-series with no extra
 infrastructure.
+
+---
+
+## PR 5 — ArgoCD PostSync hooks and in-cluster SAM deployment
+
+### The problem: SAM is a CLI tool, not a Kubernetes resource
+
+Kubernetes reconciles desired state from manifests. SAM applies desired state
+via a CLI command (`samlocal deploy`). These two models don't compose naturally
+— you can't write a YAML resource that *runs* `samlocal deploy`.
+
+ArgoCD PostSync hooks solve this: they let you run a one-shot Kubernetes Job
+after ArgoCD finishes syncing an application. The Job runs the CLI command in
+a container.
+
+### ArgoCD hook lifecycle
+
+ArgoCD defines three hook phases:
+
+| Phase | When | Use for |
+|-------|------|---------|
+| `PreSync` | Before applying resources | DB migrations, cert rotation |
+| `Sync` | During resource apply | Ordering constraints |
+| `PostSync` | After all resources are healthy | Smoke tests, deploys, cache warm |
+
+A PostSync Job is annotated:
+
+```yaml
+annotations:
+  argocd.argoproj.io/hook: PostSync
+  argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+`BeforeHookCreation` deletes the Job from the previous sync before creating the
+new one. Without it, ArgoCD would fail to create the Job because a completed
+Job with the same name already exists. The alternative is `HookSucceeded` (delete
+only on success, keep on failure for debugging).
+
+**Important:** ArgoCD will mark the application `Degraded` if the PostSync Job
+fails (exits non-zero). The backoff limit controls how many retries Kubernetes
+attempts before the Job is marked Failed.
+
+### Why LAMBDA_RUNTIME_EXECUTOR=local
+
+LocalStack normally runs each Lambda invocation in its own Docker container
+(matching the real AWS Lambda execution environment). Inside a Kubernetes pod
+there is no Docker socket, so LocalStack can't spawn containers.
+
+`LAMBDA_RUNTIME_EXECUTOR=local` tells LocalStack to run Lambda code in-process
+(the same Python interpreter as LocalStack itself). This is lighter weight,
+starts faster, and needs no Docker — the right trade-off for a single-node
+learning cluster.
+
+Trade-offs to know:
+- In-process execution has no isolation between invocations. A Lambda that
+  crashes can affect LocalStack.
+- The execution environment is the LocalStack Python interpreter, not a
+  Lambda-compatible container. Subtle SDK version differences could appear.
+- For production LocalStack use (pre-prod testing), use the Docker executor.
+
+### The deploy image (multi-stage build)
+
+```dockerfile
+# Stage 1: compile Lambda ZIPs
+FROM python:3.12-slim AS builder
+RUN pip install aws-sam-cli-local
+COPY . .
+RUN sam build --no-cached
+
+# Stage 2: minimal deploy image — pre-built artifacts + samlocal only
+FROM python:3.12-slim
+RUN pip install aws-sam-cli-local
+COPY --from=builder /app/.aws-sam/build /app/.aws-sam/build
+COPY --from=builder /app/.aws-sam/build.toml /app/.aws-sam/build.toml
+COPY template.yaml deploy.sh .
+CMD ["./deploy.sh"]
+```
+
+`sam build` runs in the CI Docker build (not in-cluster), so the in-cluster
+Job just needs `samlocal deploy`. This is the split that keeps the Job fast:
+
+- Slow part (dependency resolution, ZIP creation) → CI pipeline
+- Fast part (CloudFormation changeset apply) → in-cluster Job
+
+**Terraform analogy:** building the deploy image is like running
+`terraform plan`; `samlocal deploy` is like `terraform apply`.
+
+### deploy.sh health-check wait
+
+The PostSync Job fires as soon as ArgoCD marks all resources healthy. If
+LocalStack just restarted (e.g., after a node reboot), it may still be
+initialising. `deploy.sh` polls `/_localstack/health` before running
+`samlocal deploy`, preventing the race.
+
+```bash
+until curl -sf "${LOCALSTACK_URL}/_localstack/health" > /dev/null; do
+  sleep 3
+done
+```
+
+This is the K8s init-container pattern implemented in shell. An init container
+would be cleaner but adds another image; a loop in the main container is
+simpler for a low-stakes learning project.
+
+### Idempotency of samlocal deploy
+
+`--no-fail-on-empty-changeset` makes `samlocal deploy` exit 0 when nothing
+changed. Without it, the Job would fail on every re-sync that doesn't change
+the SAM template, because CloudFormation returns an error for a no-op deploy.
+
+CloudFormation changeset semantics: if the template and parameters haven't
+changed since the last deploy, the changeset is empty → exit 0 and do nothing.
+If they changed, CloudFormation creates and applies the changeset atomically.
